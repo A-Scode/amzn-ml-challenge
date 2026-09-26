@@ -1,0 +1,17 @@
+[project]
+name = "business-entity-resolution-starter"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "A-Scode", email = "shouryarajsinghgoud@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = []
+
+[project.scripts]
+business-entity-resolution-starter = "business_entity_resolution_starter:main"
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
