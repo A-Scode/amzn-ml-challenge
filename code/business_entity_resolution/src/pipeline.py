@@ -11,16 +11,18 @@ run_predict(): test data -> normalize -> block (-> candidate_pairs.tsv)
 """
 import json
 import os
+import shutil
 import time
 
 import joblib
 import numpy as np
 import pandas as pd
 
-from blocking import enrich, generate_candidates, TOP_K_CANDIDATES
+from blocking import TOP_K_CANDIDATES
 from cache_utils import load_or_build
-from features import build_features
-from io_utils import read_source, read_ground_truth, write_id_list_file
+from duckdb_blocking import open_blocking_database
+from features import build_features_batched
+from io_utils import read_ground_truth, write_id_list_file
 from model import train_model, predict_proba, tune_threshold, _macro_f_beta_from_grouped
 
 
@@ -29,28 +31,7 @@ def _log(msg):
 
 
 def _load_and_block(data_dir: str, split: str, top_k: int = TOP_K_CANDIDATES, cache_dir: str = None):
-    s1_path = os.path.join(data_dir, f"{split}_source1.tsv")
-    s2_path = os.path.join(data_dir, f"{split}_source2.tsv")
-    s3_path = os.path.join(data_dir, f"{split}_source3.tsv")
-
-    def _cache(name):
-        return os.path.join(cache_dir, f"{split}_{name}.pkl") if cache_dir else None
-
-    s1, _ = load_or_build(_cache("source1_enriched_v2"), [s1_path],
-                          lambda: enrich(read_source(s1_path)), label=f"{split} source1 (enriched)")
-    s2, _ = load_or_build(_cache("source2_enriched_v2"), [s2_path],
-                          lambda: enrich(read_source(s2_path)), label=f"{split} source2 (enriched)")
-    s3, _ = load_or_build(_cache("source3_enriched_v2"), [s3_path],
-                          lambda: enrich(read_source(s3_path)), label=f"{split} source3 (enriched)")
-    other = pd.concat([s2, s3], ignore_index=True, copy=False)
-    del s2, s3
-
-    candidates, _ = load_or_build(
-        _cache(f"candidates_top{top_k}"), [s1_path, s2_path, s3_path],
-        lambda: generate_candidates(s1, other, top_k=top_k),
-        label=f"{split} candidates (top_k={top_k})",
-    )
-    return s1, other, candidates
+    return open_blocking_database(data_dir, split, top_k=top_k, cache_dir=cache_dir)
 
 
 def _truth_map_from_gt(gt: pd.DataFrame) -> dict:
@@ -66,17 +47,27 @@ def run_train(train_dir: str, model_dir: str, top_k: int = TOP_K_CANDIDATES,
     t0 = time.time()
     os.makedirs(model_dir, exist_ok=True)
     _log("=== stage 1/4: load + normalize + block ===")
-    s1, other, candidates = _load_and_block(train_dir, "train", top_k=top_k, cache_dir=cache_dir)
-    gt_path = os.path.join(train_dir, "train_ground_truth.tsv")
-    truth_map = _truth_map_from_gt(read_ground_truth(gt_path))
+    connection, candidates, all_s1_ids, temporary_dir = _load_and_block(
+        train_dir, "train", top_k=top_k, cache_dir=cache_dir
+    )
 
     _log("=== stage 2/4: featurize + label ===")
     src_paths = [os.path.join(train_dir, f"train_source{i}.tsv") for i in (1, 2, 3)]
-    feat_cache = os.path.join(cache_dir, f"train_features_top{top_k}.pkl") if cache_dir else None
-    feats, _ = load_or_build(
-        feat_cache, src_paths, lambda: build_features(candidates, s1, other),
-        label=f"train features (top_k={top_k})",
-    )
+    feat_cache = os.path.join(cache_dir, f"train_features_duckdb_v1_top{top_k}.pkl") if cache_dir else None
+    try:
+        feats, _ = load_or_build(
+            feat_cache, src_paths,
+            lambda: build_features_batched(candidates, connection),
+            label=f"train features (top_k={top_k})",
+        )
+    finally:
+        connection.close()
+        if temporary_dir:
+            shutil.rmtree(temporary_dir, ignore_errors=True)
+    del candidates
+
+    gt_path = os.path.join(train_dir, "train_ground_truth.tsv")
+    truth_map = _truth_map_from_gt(read_ground_truth(gt_path))
     feats["label"] = [
         1 if cid in truth_map.get(s1id, set()) else 0
         for s1id, cid in zip(feats["source1_entity_id"], feats["entity_id"])
@@ -89,7 +80,8 @@ def run_train(train_dir: str, model_dir: str, top_k: int = TOP_K_CANDIDATES,
 
     # --- group split by S1 id so no entity's pairs leak across train/val ---
     rng = np.random.RandomState(seed)
-    all_s1 = np.array(s1["entity_id"].unique().tolist())
+    all_s1 = np.asarray(all_s1_ids)
+    del all_s1_ids
     rng.shuffle(all_s1)
     n_val = max(1, int(len(all_s1) * val_frac))
     val_ids = set(all_s1[:n_val])
@@ -139,16 +131,19 @@ def _deconflict_global(scored: pd.DataFrame, threshold: float) -> pd.DataFrame:
 
 
 def run_predict(test_dir: str, model_dir: str, output_dir: str,
-                 top_k: int = TOP_K_CANDIDATES, cache_dir: str = None):
+                 top_k: int = None, cache_dir: str = None):
     t0 = time.time()
     with open(os.path.join(model_dir, "config.json")) as f:
         cfg = json.load(f)
+    if top_k is None:
+        top_k = cfg.get("top_k_candidates", TOP_K_CANDIDATES)
     threshold = cfg["threshold"]
     model = joblib.load(os.path.join(model_dir, "matcher.lgbm.joblib"))
 
     _log("=== stage 1/3: load + normalize + block test set ===")
-    s1, other, candidates = _load_and_block(test_dir, "test", top_k=top_k, cache_dir=cache_dir)
-    required_s1_ids = s1["entity_id"].tolist()
+    connection, candidates, required_s1_ids, temporary_dir = _load_and_block(
+        test_dir, "test", top_k=top_k, cache_dir=cache_dir
+    )
 
     cand_map = (
         candidates.sort_values("quick_score", ascending=False)
@@ -159,14 +154,22 @@ def run_predict(test_dir: str, model_dir: str, output_dir: str,
         ("source1_entity_id", "candidate_entity_ids"),
         cand_map, required_s1_ids,
     )
+    candidate_count = len(candidates)
 
     _log("=== stage 2/3: featurize + score test candidates ===")
     src_paths = [os.path.join(test_dir, f"test_source{i}.tsv") for i in (1, 2, 3)]
-    feat_cache = os.path.join(cache_dir, f"test_features_top{top_k}.pkl") if cache_dir else None
-    feats, _ = load_or_build(
-        feat_cache, src_paths, lambda: build_features(candidates, s1, other),
-        label=f"test features (top_k={top_k})",
-    )
+    feat_cache = os.path.join(cache_dir, f"test_features_duckdb_v1_top{top_k}.pkl") if cache_dir else None
+    try:
+        feats, _ = load_or_build(
+            feat_cache, src_paths,
+            lambda: build_features_batched(candidates, connection),
+            label=f"test features (top_k={top_k})",
+        )
+    finally:
+        connection.close()
+        if temporary_dir:
+            shutil.rmtree(temporary_dir, ignore_errors=True)
+    del candidates
     feats["proba"] = predict_proba(model, feats)
 
     _log("=== stage 3/3: threshold + de-conflict + write outputs ===")
@@ -183,6 +186,6 @@ def run_predict(test_dir: str, model_dir: str, output_dir: str,
 
     n_matched_entities = sum(1 for v in match_map.values() if v)
     print(f"Test S1 entities: {len(required_s1_ids)} | with >=1 predicted match: {n_matched_entities}")
-    print(f"Candidate set size: {len(candidates)} rows | Matches written: {len(kept)} rows")
+    print(f"Candidate set size: {candidate_count} rows | Matches written: {len(kept)} rows")
     _log(f"total prediction time: {time.time() - t0:.1f}s")
     return match_map, cand_map

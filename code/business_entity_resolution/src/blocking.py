@@ -80,7 +80,7 @@ def _normalize_columns(series, func_chunk, column_names, label, chunk_size=25_00
     return columns
 
 MAX_BLOCK_SIZE = 800   # drop a key value if it matches more than this many S2/S3 records
-TOP_K_CANDIDATES = 25  # final candidates kept per S1 entity
+TOP_K_CANDIDATES = 5  # lower default keeps the full pairwise feature set manageable
 
 
 def enrich(df: pd.DataFrame) -> pd.DataFrame:

@@ -5,6 +5,7 @@ Usage:
     python3 src/train.py --train-dir dataset/train --model-dir models
 """
 import argparse
+from blocking import TOP_K_CANDIDATES
 from pipeline import run_train
 
 
@@ -12,7 +13,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--train-dir", default="dataset/train")
     p.add_argument("--model-dir", default="models")
-    p.add_argument("--top-k", type=int, default=25,
+    p.add_argument("--top-k", type=int, default=TOP_K_CANDIDATES,
                     help="Max candidates kept per S1 entity after blocking.")
     p.add_argument("--val-frac", type=float, default=0.2,
                     help="Fraction of S1 entities held out (by group) for threshold tuning.")

@@ -55,10 +55,16 @@ def build_features(pairs: pd.DataFrame, s1_df: pd.DataFrame, other_df: pd.DataFr
 
     df = pairs.merge(s1_small, on="source1_entity_id").merge(other_small, on="entity_id")
 
+    return _compute_features(df)
+
+
+def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
     n = len(df)
     _log(f"computing {len(FEATURE_COLUMNS)} features for {n:,} candidate pairs...")
     if n == 0:
-        return pairs.assign(**{c: pd.Series(dtype=float) for c in FEATURE_COLUMNS})
+        return df[["source1_entity_id", "entity_id"]].assign(
+            **{column: pd.Series(dtype=float) for column in FEATURE_COLUMNS}
+        )
 
     name_s1 = df["name_clean_s1"].tolist()
     name_o = df["name_clean_o"].tolist()
@@ -96,3 +102,63 @@ def build_features(pairs: pd.DataFrame, s1_df: pd.DataFrame, other_df: pd.DataFr
 
     _log("done.")
     return df[["source1_entity_id", "entity_id"] + FEATURE_COLUMNS]
+
+
+def build_features_batched(pairs: pd.DataFrame, connection, batch_size: int = 25_000) -> pd.DataFrame:
+    """Compute pair features in bounded joins against DuckDB source tables."""
+    n = len(pairs)
+    result = pairs[["source1_entity_id", "entity_id"]].reset_index(drop=True).copy()
+    feature_arrays = {
+        column: np.empty(n, dtype=np.float32) for column in FEATURE_COLUMNS
+    }
+    if n == 0:
+        for column, values in feature_arrays.items():
+            result[column] = values
+        return result
+
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        pair_batch = pairs.iloc[start:end][
+            ["source1_entity_id", "entity_id", "quick_score"]
+        ].copy()
+        pair_batch["_feature_row"] = np.arange(start, end, dtype=np.int64)
+        connection.register("_feature_pairs", pair_batch)
+        joined = connection.execute("""
+            SELECT p.source1_entity_id, p.entity_id, p.quick_score,
+                p._feature_row,
+                s.name_clean AS name_clean_s1,
+                s.name_core AS name_core_s1,
+                s.name_core_tokens AS name_core_tokens_s1,
+                s.name_first_token AS name_first_token_s1,
+                s.name_acronym AS name_acronym_s1,
+                s.addr_clean AS addr_clean_s1,
+                s.addr_core_tokens AS addr_core_tokens_s1,
+                s.addr_postal AS addr_postal_s1,
+                s.country_norm AS country_norm_s1,
+                o.name_clean AS name_clean_o,
+                o.name_core AS name_core_o,
+                o.name_core_tokens AS name_core_tokens_o,
+                o.name_first_token AS name_first_token_o,
+                o.name_acronym AS name_acronym_o,
+                o.addr_clean AS addr_clean_o,
+                o.addr_core_tokens AS addr_core_tokens_o,
+                o.addr_postal AS addr_postal_o,
+                o.country_norm AS country_norm_o
+            FROM _feature_pairs p
+            INNER JOIN source1 s ON s.entity_id = p.source1_entity_id
+            INNER JOIN other o ON o.entity_id = p.entity_id
+            ORDER BY p._feature_row
+        """).fetch_df()
+        connection.unregister("_feature_pairs")
+        computed = _compute_features(joined)
+        row_numbers = joined["_feature_row"].to_numpy(dtype=np.int64, copy=False)
+        for column in FEATURE_COLUMNS:
+            feature_arrays[column][row_numbers] = computed[column].to_numpy(
+                dtype=np.float32, copy=False
+            )
+        _log(f"feature batches: {end:,}/{n:,} pairs")
+        del pair_batch, joined, computed
+
+    for column, values in feature_arrays.items():
+        result[column] = values
+    return result

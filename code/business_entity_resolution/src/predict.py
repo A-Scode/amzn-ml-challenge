@@ -13,7 +13,8 @@ def main():
     p.add_argument("--test-dir", default="dataset/test")
     p.add_argument("--model-dir", default="models")
     p.add_argument("--output-dir", default="output")
-    p.add_argument("--top-k", type=int, default=25)
+    p.add_argument("--top-k", type=int, default=None,
+                    help="Candidate limit (defaults to the value saved with the model).")
     p.add_argument("--cache-dir", default="cache",
                     help="Where to store/reuse preprocessed data across runs (same "
                          "cache dir as train.py so the test-side normalization is "
