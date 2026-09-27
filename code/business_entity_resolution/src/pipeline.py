@@ -36,20 +36,21 @@ def _load_and_block(data_dir: str, split: str, top_k: int = TOP_K_CANDIDATES, ca
     def _cache(name):
         return os.path.join(cache_dir, f"{split}_{name}.pkl") if cache_dir else None
 
-    s1, _ = load_or_build(_cache("source1_enriched"), [s1_path],
+    s1, _ = load_or_build(_cache("source1_enriched_v2"), [s1_path],
                           lambda: enrich(read_source(s1_path)), label=f"{split} source1 (enriched)")
-    s2, _ = load_or_build(_cache("source2_enriched"), [s2_path],
+    s2, _ = load_or_build(_cache("source2_enriched_v2"), [s2_path],
                           lambda: enrich(read_source(s2_path)), label=f"{split} source2 (enriched)")
-    s3, _ = load_or_build(_cache("source3_enriched"), [s3_path],
+    s3, _ = load_or_build(_cache("source3_enriched_v2"), [s3_path],
                           lambda: enrich(read_source(s3_path)), label=f"{split} source3 (enriched)")
-    other = pd.concat([s2, s3], ignore_index=True)
+    other = pd.concat([s2, s3], ignore_index=True, copy=False)
+    del s2, s3
 
     candidates, _ = load_or_build(
         _cache(f"candidates_top{top_k}"), [s1_path, s2_path, s3_path],
         lambda: generate_candidates(s1, other, top_k=top_k),
         label=f"{split} candidates (top_k={top_k})",
     )
-    return s1, s2, s3, other, candidates
+    return s1, other, candidates
 
 
 def _truth_map_from_gt(gt: pd.DataFrame) -> dict:
@@ -65,7 +66,7 @@ def run_train(train_dir: str, model_dir: str, top_k: int = TOP_K_CANDIDATES,
     t0 = time.time()
     os.makedirs(model_dir, exist_ok=True)
     _log("=== stage 1/4: load + normalize + block ===")
-    s1, s2, s3, other, candidates = _load_and_block(train_dir, "train", top_k=top_k, cache_dir=cache_dir)
+    s1, other, candidates = _load_and_block(train_dir, "train", top_k=top_k, cache_dir=cache_dir)
     gt_path = os.path.join(train_dir, "train_ground_truth.tsv")
     truth_map = _truth_map_from_gt(read_ground_truth(gt_path))
 
@@ -146,7 +147,7 @@ def run_predict(test_dir: str, model_dir: str, output_dir: str,
     model = joblib.load(os.path.join(model_dir, "matcher.lgbm.joblib"))
 
     _log("=== stage 1/3: load + normalize + block test set ===")
-    s1, s2, s3, other, candidates = _load_and_block(test_dir, "test", top_k=top_k, cache_dir=cache_dir)
+    s1, other, candidates = _load_and_block(test_dir, "test", top_k=top_k, cache_dir=cache_dir)
     required_s1_ids = s1["entity_id"].tolist()
 
     cand_map = (

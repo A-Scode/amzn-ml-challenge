@@ -20,7 +20,7 @@ join) — this is the standard "stop-word" trick for blocking.
 """
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 
 import pandas as pd
 
@@ -32,52 +32,52 @@ def _log(msg):
 
 
 def _normalize_name_chunk(chunk):
-    return [normalize_name(x) for x in chunk]
+    return [
+        (item["clean"], item["core"], " ".join(item["core_tokens"]),
+         item["first_token"], item["acronym"])
+        for item in map(normalize_name, chunk)
+    ]
 
 
 def _normalize_addr_chunk(chunk):
-    return [normalize_address(x) for x in chunk]
+    return [
+        (item["clean"], item["postal_code"], " ".join(item["core_tokens"]))
+        for item in map(normalize_address, chunk)
+    ]
 
 
-def _chunks(values, size):
-    for i in range(0, len(values), size):
-        yield values[i:i + size]
+def _normalize_columns(series, func_chunk, column_names, label, chunk_size=25_000):
+    """Normalize bounded batches and retain only the final column values."""
+    n_workers = max(1, int(os.environ.get("BER_NORMALIZE_WORKERS", "1")))
+    _log(f"  {label}: n_workers={n_workers}, batch_size={chunk_size:,}")
+    columns = {name: [] for name in column_names}
+    n = len(series)
+    batch_width = chunk_size * n_workers
+    completed = 0
 
+    executor = ProcessPoolExecutor(max_workers=n_workers) if n_workers > 1 else None
+    try:
+        for batch_start in range(0, n, batch_width):
+            chunks = [
+                series.iloc[start:min(start + chunk_size, n)].tolist()
+                for start in range(batch_start, min(batch_start + batch_width, n), chunk_size)
+            ]
+            if executor:
+                results = list(executor.map(func_chunk, chunks))
+            else:
+                results = [func_chunk(chunk) for chunk in chunks]
 
-def _parallel_map(func_chunk, values, chunk_size=200_000, n_workers=None, label=""):
-    """Split `values` into chunks and normalize them across processes.
+            for rows in results:
+                for column_index, name in enumerate(column_names):
+                    columns[name].extend(row[column_index] for row in rows)
+                completed += 1
+                _log(f"  {label}: chunk {completed} done ({n_workers} workers)")
+            del chunks, results
+    finally:
+        if executor:
+            executor.shutdown()
 
-    Falls back to a plain single-process loop (still chunked, so progress
-    logging still works) if the dataset is small or multiprocessing can't be
-    used in this environment.
-    """
-    # Forked workers duplicate pandas/string memory and can push a modest
-    # machine into swap. Opt in to parallelism only when the host has room.
-    n_workers = n_workers or int(os.environ.get("BER_NORMALIZE_WORKERS", "1"))
-    n_workers = max(1, n_workers)
-    _log(f"  {label}: n_workers={n_workers}")
-    chunk_list = list(_chunks(values, chunk_size))
-    n_chunks = len(chunk_list)
-    if n_chunks <= 1 or n_workers <= 1:
-        out = []
-        for i, c in enumerate(chunk_list, 1):
-            out.extend(func_chunk(c))
-            _log(f"  {label}: chunk {i}/{n_chunks} done (single-process)")
-        return out
-
-    results = [None] * n_chunks
-    done = 0
-    with ProcessPoolExecutor(max_workers=n_workers) as ex:
-        futures = {ex.submit(func_chunk, c): i for i, c in enumerate(chunk_list)}
-        for fut in as_completed(futures):
-            i = futures[fut]
-            results[i] = fut.result()
-            done += 1
-            _log(f"  {label}: chunk {done}/{n_chunks} done ({n_workers} workers)")
-    out = []
-    for r in results:
-        out.extend(r)
-    return out
+    return columns
 
 MAX_BLOCK_SIZE = 800   # drop a key value if it matches more than this many S2/S3 records
 TOP_K_CANDIDATES = 25  # final candidates kept per S1 entity
@@ -86,24 +86,28 @@ TOP_K_CANDIDATES = 25  # final candidates kept per S1 entity
 def enrich(df: pd.DataFrame) -> pd.DataFrame:
     """Attach normalized name/address fields to a source dataframe."""
     _log(f"normalizing {len(df):,} records (memory-safe chunked mode)...")
-    # Keep only columns consumed by blocking and feature generation.
-    df = df[["entity_id", "business_name", "business_address", "country"]].copy()
-    names = _parallel_map(_normalize_name_chunk, df["business_name"].tolist(), label="names")
-    addrs = _parallel_map(_normalize_addr_chunk, df["business_address"].tolist(), label="addresses")
-    df["name_clean"] = [n["clean"] for n in names]
-    df["name_core"] = [n["core"] for n in names]
-    df["name_core_tokens"] = [n["core_tokens"] for n in names]
-    df["name_first_token"] = [n["first_token"] for n in names]
-    df["name_acronym"] = [n["acronym"] for n in names]
-    df["addr_clean"] = [a["clean"] for a in addrs]
-    df["addr_postal"] = [a["postal_code"] for a in addrs]
-    df["addr_core_tokens"] = [a["core_tokens"] for a in addrs]
-    df["country_norm"] = df["country"].astype(str).str.strip().str.lower()
-    del names, addrs
-    return df
+    names = _normalize_columns(
+        df["business_name"], _normalize_name_chunk,
+        ("name_clean", "name_core", "name_core_tokens", "name_first_token", "name_acronym"),
+        "names",
+    )
+    addresses = _normalize_columns(
+        df["business_address"], _normalize_addr_chunk,
+        ("addr_clean", "addr_postal", "addr_core_tokens"), "addresses",
+    )
+    result = pd.DataFrame({"entity_id": df["entity_id"].to_numpy(copy=False)})
+    for columns in (names, addresses):
+        for name, values in columns.items():
+            result[name] = values
+    result["country_norm"] = df["country"].str.strip().str.lower().to_numpy(copy=False)
+    _log(f"normalization complete: {len(result):,} records, {len(result.columns)} columns")
+    del df, names, addresses
+    return result
 
 
 def _first_two_sorted(tokens):
+    if isinstance(tokens, str):
+        tokens = tokens.split()
     sig = sorted(tokens[:3])[:2]
     return "-".join(sig) if len(sig) == 2 else ""
 
@@ -152,6 +156,10 @@ def _pairs_for_key(s1_df: pd.DataFrame, other_df: pd.DataFrame,
 
 
 def _jaccard(a, b):
+    if isinstance(a, str):
+        a = a.split()
+    if isinstance(b, str):
+        b = b.split()
     a, b = set(a), set(b)
     if not a and not b:
         return 0.0
@@ -186,12 +194,17 @@ def generate_candidates(s1_df: pd.DataFrame, other_df: pd.DataFrame,
     Returns columns: source1_entity_id, entity_id (candidate), quick_score
     """
     _log(f"building blocking keys for {len(s1_df):,} S1 and {len(other_df):,} S2/S3 records...")
-    key_pairs = []
+    pairs = None
     for key_type in ("name_first", "name_pair", "postal", "acronym"):
         current = _pairs_for_key(s1_df, other_df, key_type)
         _log(f"{key_type}: {len(current):,} candidate pairs")
-        key_pairs.append(current)
-    pairs = pd.concat(key_pairs, ignore_index=True).drop_duplicates()
+        if pairs is None:
+            pairs = current
+        else:
+            pairs = pd.concat([pairs, current], ignore_index=True).drop_duplicates(
+                ignore_index=True
+            )
+            del current
     _log(f"{len(pairs):,} raw candidate pairs after union of all blocking keys")
 
     if pairs.empty:
@@ -214,6 +227,7 @@ def generate_candidates(s1_df: pd.DataFrame, other_df: pd.DataFrame,
         "addr_core_tokens": "addr_core_tokens_other",
         "addr_postal": "addr_postal_other",
     })
+    del pairs, s1_small, other_small
 
     _log("scoring candidate pairs for pruning...")
     merged["quick_score"] = _quick_scores(
@@ -224,4 +238,6 @@ def generate_candidates(s1_df: pd.DataFrame, other_df: pd.DataFrame,
     merged = merged.sort_values(["source1_entity_id", "quick_score"], ascending=[True, False])
     pruned = merged.groupby("source1_entity_id", sort=False).head(top_k)
     _log(f"pruned to {len(pruned):,} candidate pairs (top_k={top_k} per S1 entity)")
-    return pruned[["source1_entity_id", "entity_id", "quick_score"]].reset_index(drop=True)
+    result = pruned[["source1_entity_id", "entity_id", "quick_score"]].reset_index(drop=True)
+    del merged, pruned
+    return result

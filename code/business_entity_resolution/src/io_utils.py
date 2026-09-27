@@ -12,7 +12,14 @@ def _log(msg):
 
 def read_source(path: str) -> pd.DataFrame:
     _log(f"reading {path} ...")
-    df = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False, na_values=[])
+    df = pd.read_csv(
+        path,
+        sep="\t",
+        dtype=str,
+        keep_default_na=False,
+        na_values=[],
+        usecols=["entity_id", "business_name", "business_address", "country"],
+    )
     df["business_name"] = df["business_name"].fillna("")
     df["business_address"] = df["business_address"].fillna("")
     df["country"] = df["country"].fillna("")

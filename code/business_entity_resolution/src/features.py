@@ -27,6 +27,10 @@ FEATURE_COLUMNS = [
 
 
 def _token_jaccard(a, b):
+    if isinstance(a, str):
+        a = a.split()
+    if isinstance(b, str):
+        b = b.split()
     a, b = set(a), set(b)
     if not a and not b:
         return 1.0
